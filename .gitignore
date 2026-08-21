@@ -1,0 +1,6 @@
+# Built binaries -- one clang line each, no reason to ship them.
+src/t80_bridge
+src/hid_report_dump
+src/hid_phase_map
+*.dSYM/
+.DS_Store
