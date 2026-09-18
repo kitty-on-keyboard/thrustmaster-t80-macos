@@ -23,8 +23,11 @@ X=128  Y=128  Z=128  Rz=128  Hat=8  Rx=0  Ry=0
 ```
 
 The buttons in that same report *do* change. So the device is alive, the report
-is arriving, and macOS is parsing it correctly — the analogue fields it
-advertises are simply dead.
+is arriving, and IOHID is parsing it — the analogue fields it advertises are
+simply dead. Apple still sets `GameControllerSupportedHIDDevice=No`, so Godot
+and SDL's joypad list can be empty while the wheel is on USB. Buttons then
+never become gamepad events either, which is why they ride the same UDP packet
+as the axes.
 
 The real data is in the **vendor section of the same report**, which no generic
 driver reads, because nothing in the descriptor says what it is.
@@ -42,7 +45,9 @@ Input report ID 1, 64 bytes. Little-endian `uint16`:
 | 43–44 | **steering** | ~32900 | 0 … 65535 | centre is near but not exactly 0x8000 |
 | 45–46 | **throttle** | 65535 | → 0 | inverted: 65535 released, 0 floored |
 | 47–48 | **brake** | 65535 | → 0 | inverted, same as throttle |
-| 5 | hat + buttons | 8 | — | already handled by the normal HID path |
+| 5, low nibble | **hat** | 8 | 0=N … 7=NW | same packing as Linux hid-t80 |
+| 5, high nibble | **face** | 0 | bits 0–3 | Triangle, Cross, Circle, Square |
+| 6 | **shoulders / system** | 0 | bits 0–7 | L1 R1 L2 R2 Select Start L3 R3 |
 
 Steering is 16-bit, so you get considerably finer resolution than the 8-bit axis
 the descriptor advertises.
@@ -57,8 +62,8 @@ noisy low byte on the steering (a potentiometer doing what potentiometers do).
 Needs only the Xcode command line tools (`xcode-select --install`).
 
 ```sh
-git clone <this repo>
-cd t80-macos/src
+git clone https://github.com/kitty-on-keyboard/thrustmaster-t80-macos.git
+cd thrustmaster-t80-macos/src
 ./build.sh
 ./t80_bridge -v
 ```
@@ -67,15 +72,18 @@ Keep your hands off the wheel for the first second — it averages the first 60
 samples to find centre, because the rest position is not exactly 0x8000 and a
 fixed centre puts a permanent lean on the steering.
 
-It then sends `steer throttle brake` as plain text to `127.0.0.1:7654` at about
-40 Hz:
+It then sends `steer throttle brake buttons hat` as plain text to
+`127.0.0.1:7654` at about 40 Hz:
 
 ```
--0.4213 0.0000 0.8817
+-0.4213 0.0000 0.8817 0 8
 ```
 
-`steer` is −1 … +1, `throttle` and `brake` are 0 … 1. Text rather than packed
-floats so you can watch the stream with `nc -ul 7654` while debugging.
+`steer` is −1 … +1, `throttle` and `brake` are 0 … 1, `buttons` is a 12-bit mask
+(bit 0 = Triangle … bit 11 = R3), `hat` is 0–7 or 8 for neutral. Older readers
+that only split three floats still work if they accept `size() >= 3`. Text
+rather than packed floats so you can watch the stream with `nc -ul 7654`
+while debugging.
 
 Consuming it is a few lines in anything. Godot, for example:
 
@@ -86,13 +94,18 @@ udp.bind(7654, "127.0.0.1")
 func _process(_delta):
     while udp.get_available_packet_count() > 0:
         var p := udp.get_packet().get_string_from_utf8().split(" ", false)
-        if p.size() == 3:
+        if p.size() >= 3:
             steer = float(p[0]); throttle = float(p[1]); brake = float(p[2])
+        if p.size() >= 5:
+            buttons = int(p[3]); hat = int(p[4])
 ```
 
-If your engine has an input system, replaying these as synthetic joypad axis
-events is usually less work than plumbing three floats through — every binding,
-deadzone and bit of driving code downstream then treats the wheel as a gamepad.
+If your engine has an input system, replay these as synthetic joypad events
+on device `-1` (every device). Pinning device `0` is dropped when Godot's
+joypad list is empty, which it is for this wheel: Apple sets
+`GameControllerSupportedHIDDevice=No`, so SDL/Godot never enumerate it even
+though IOHID can see it. That is also why buttons have to ride this socket —
+the HID gamepad path does not reach the engine.
 
 ## Decoding your own wheel
 
@@ -144,13 +157,15 @@ Two things, in case they save you the same hours:
 - Tested on **exactly one T80**, on one firmware, on Apple Silicon (macOS 26).
   I have no way to know how far the offsets generalise across T80 revisions, let
   alone to the T150/T248/TMX.
-- Buttons are deliberately left alone. They already work through the normal HID
-  path; this only bridges the three analogue axes.
+- Buttons and the hat are in the same report (bytes 5–6). They used to be
+  left to the HID gamepad path; on macOS that path is dead for this VID/PID
+  because the device is not a Game Controller framework device. The bridge
+  therefore emits them too.
 - No force feedback. The T80 has none.
 - Steering deadzone is a fixed ±0.012 to kill low-byte sensor noise. Adjust in
   `t80_bridge.c` if your unit is quieter or noisier.
-- The bridge is a separate process. It does not start with your game, and it
-  needs restarting if you replug the wheel.
+- The bridge reconnects if you unplug the wheel. It is still a separate
+  process, and `IOHIDManagerOpen` needs Input Monitoring if macOS asks.
 
 ## Contributing
 
